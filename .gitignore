@@ -1,0 +1,7 @@
+# Deny everything by default — this is a safety net, not the only protection.
+# We NEVER use git add -A or git add . in this repo; only explicit filenames.
+*
+!*.py
+!*.sh
+!.gitignore
+!README.md
