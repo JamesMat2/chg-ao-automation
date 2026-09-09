@@ -2,7 +2,13 @@ import anthropic
 import json
 import os
 import re
+import sys
 from datetime import datetime
+sys.path.insert(0, '/root')
+from analyze_ao import (
+    TruncatedResponseError, ResponseRefusedError,
+    apply_refusal_substitutions, restore_refusal_substitutions,
+)
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -151,7 +157,7 @@ def load_projects_library():
 # ── Claude API call ────────────────────────────────────────────────────────────
 
 def run_planning_analysis(gonogo_data, cvs, projects):
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"), max_retries=5)
 
     ident  = gonogo_data.get("identification", {})
     desc   = gonogo_data.get("description_projet", {})
@@ -227,6 +233,7 @@ RÈGLES CRITIQUES POUR LES FICHES DE PROJETS:
 - EXCLURE toute fiche hors domaine (ex: si AO = route, exclure ponceaux isolés, bâtiments, foresterie)
 - Pour chaque fiche suggérée: identifier quel chargé de projet de l'équipe proposée est le plus associé à cette fiche
 - Maximum 8 fiches, toutes pertinentes au domaine exact de l'AO
+- Pour le champ 'pertinence': utiliser EXACTEMENT une des 4 valeurs suivantes (aucune autre variante ou formulation): "Très élevée" | "Élevée" | "Moyenne" | "Faible"
 
 Retourne UNIQUEMENT un JSON valide avec cette structure:
 {{
@@ -274,17 +281,39 @@ Retourne UNIQUEMENT un JSON valide avec cette structure:
 
 Réponds UNIQUEMENT avec le JSON, sans texte avant ou après."""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
-        max_tokens=8000,
-        messages=[{"role": "user", "content": prompt}]
-    )
+    def _planning_call(prompt_text, max_tokens=8000):
+        _response = client.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt_text}]
+        )
+        if _response.stop_reason == "max_tokens":
+            raise TruncatedResponseError(f"planning response truncated at max_tokens={max_tokens}")
+        if _response.stop_reason == "refusal" or not _response.content:
+            raise ResponseRefusedError(f"planning response refused or empty (stop_reason={_response.stop_reason!r})")
+        _result_text = _response.content[0].text.strip()
+        if _result_text.startswith("```"):
+            _result_text = _result_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        return json.loads(_result_text)
 
-    result_text = response.content[0].text.strip()
-    if result_text.startswith("```"):
-        result_text = result_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-    planning_data = json.loads(result_text)
+    # Session 52: nested try -- ResponseRefusedError must wrap BOTH the
+    # initial call and the truncation-retry, not just the first, per the
+    # real bug found and fixed in analyze_ao.py's main call today (the
+    # truncation-retry can itself come back refused, not just truncated
+    # again). Substitution retry uses max_tokens=16000 to match whichever
+    # budget was in play when the refusal happened. This call runs after
+    # analyze_ao_gonogo()'s restoration, reading the real facility name back
+    # from gonogo_data -- exposed to the same real trigger content
+    # independently, not just a hypothetical future AO.
+    try:
+        try:
+            planning_data = _planning_call(prompt)
+        except (json.JSONDecodeError, IndexError, TruncatedResponseError) as _je:
+            print(f"  [JSON parse retry] initial parse failed ({_je}) — retrying once with higher max_tokens")
+            planning_data = _planning_call(prompt, max_tokens=16000)
+    except ResponseRefusedError as _re:
+        print(f"  [refusal retry] planning call refused ({_re}) — retrying once with known-trigger-phrase substitution")
+        planning_data = _planning_call(apply_refusal_substitutions(prompt), max_tokens=16000)
 
     # ── Banque de ressources — ALL remaining CVs including DDM ────────────────
     assigned_names = set()
@@ -343,6 +372,17 @@ Réponds UNIQUEMENT avec le JSON, sans texte avant ou après."""
             max_tokens=4000,
             messages=[{'role': 'user', 'content': banque_prompt}]
         )
+        # Session 52: diagnostic-only (matches pipeline_w2.py STEP 8 /
+        # banque_ressources' own existing pattern) -- this already gracefully
+        # degrades to banque_count: 0 on any failure via the broad except
+        # below, indistinguishable from a genuine zero (the original audit's
+        # own MEDIUM finding). No retry/substitution: lower stakes than the
+        # main planning call, no evidence this specific call has hit either
+        # failure mode.
+        if banque_response.stop_reason == "max_tokens":
+            raise TruncatedResponseError("banque_ressources response truncated at max_tokens=4000")
+        if banque_response.stop_reason == "refusal" or not banque_response.content:
+            raise ResponseRefusedError(f"banque_ressources response refused or empty (stop_reason={banque_response.stop_reason!r})")
         banque_text = banque_response.content[0].text.strip()
         if banque_text.startswith('```'):
             banque_text = banque_text.split('\n', 1)[1].rsplit('```', 1)[0].strip()
@@ -350,12 +390,41 @@ Réponds UNIQUEMENT avec le JSON, sans texte avant ou après."""
         print(f'  Banque: {banque_data.get("banque_count", 0)} ressources identifiées')
     except Exception as e:
         print(f'  Banque: erreur - {e}')
-        banque_data = {'banque_count': 0}
+        # Session 52: mark the error explicitly in the persisted data itself,
+        # not just the log -- banque_count: 0 alone is indistinguishable from
+        # a genuine zero-match result. Making this visually distinct in the
+        # final .docx is a separate, deferred follow-up (same category as
+        # Column E/K's visual-distinction gap); this only guarantees the data
+        # layer carries the signal.
+        banque_data = {'banque_count': 0, 'banque_error': str(e)}
 
     planning_data['banque_ressources'] = banque_data
+    # Session 52: single, unconditional restoration point -- covers both the
+    # main planning call's fields and banque_ressources' output (merged
+    # above) in one pass. Safe/idempotent whether or not substitution was
+    # ever triggered this run.
+    planning_data = restore_refusal_substitutions(planning_data)
     return planning_data
 
 # ── Build Word document ────────────────────────────────────────────────────────
+
+def _pertinence_rank(fiche):
+    """
+    Ranks a fiche's pertinence for sorting (0 = most pertinent). Primarily
+    matches the fixed 4-value vocabulary from the prompt, with fuzzy fallback
+    matching (mirrors the existing bg_pert color-coding logic) in case the
+    model doesn't perfectly comply.
+    """
+    p = (fiche.get("pertinence") or "").strip().lower()
+    if "tr\u00e8s \u00e9lev\u00e9e" in p or "tres elevee" in p:
+        return 0
+    if "\u00e9lev\u00e9e" in p or "elevee" in p or "haute" in p:
+        return 1
+    if "moyenne" in p:
+        return 2
+    if "faible" in p:
+        return 3
+    return 4
 
 def build_planning_document(gonogo_data, planning_data, output_path):
     ident  = gonogo_data.get("identification", {})
@@ -365,7 +434,7 @@ def build_planning_document(gonogo_data, planning_data, output_path):
 
     criteres_succes = planning_data.get("criteres_succes", [])
     ressources      = planning_data.get("ressources_suggerees", [])
-    fiches          = planning_data.get("fiches_suggerees", [])
+    fiches          = sorted(planning_data.get("fiches_suggerees", []), key=_pertinence_rank)
     sous_traitance  = planning_data.get("sous_traitance", [])
     notes_strat     = planning_data.get("notes_strategiques", "")
 

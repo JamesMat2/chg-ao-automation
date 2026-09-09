@@ -28,6 +28,39 @@ FERIES_QC = {
     date(2026,12,25),
 }
 
+def oui_non_pas_specifie(val):
+    # Session 47 fix: sous_traitance_autorisee / consortium_autorise are now
+    # 3-state strings ("oui" / "non" / "non_specifie") instead of booleans,
+    # so "not mentioned in the AO" can be distinguished from "explicitly
+    # forbidden". Also tolerates legacy boolean values from older cached JSON.
+    if val is True:
+        return "Oui"
+    if val is False:
+        return "Non"
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v == "oui":
+            return "Oui"
+        if v == "non":
+            return "Non"
+        if v == "non_specifie":
+            return "Pas spécifié"
+    return ""
+
+
+def truncate_citation(text, max_len=180):
+    # Session 54: citation-bearing fields (cumul_roles_autorise,
+    # autres_disciplines_separees) can carry a full AO sentence -- cap
+    # display length so a long citation doesn't make the report harder to
+    # scan for the go/no-go committee.
+    if not text:
+        return text
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rstrip() + "..."
+
+
 def business_days_between(d1, d2):
     """Count business days between two date objects (d1=start, d2=end). QC holidays excluded."""
     count = 0
@@ -137,6 +170,30 @@ def cell_para(cell, text, bold=False, size=9, color=None, bg=None, align=None):
     if color:
         run.font.color.rgb = color
 
+def _split_top_level_commas(text):
+    """
+    Splits text on commas, but ignores commas nested inside parentheses.
+    e.g. "A (1, 2), B (3)" -> ["A (1, 2)", "B (3)"], not 4 pieces.
+    """
+    segments = []
+    depth = 0
+    current = []
+    for ch in text:
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth = max(0, depth - 1)
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            segments.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        segments.append(''.join(current).strip())
+    return [s for s in segments if s]
+
 def split_into_segments(text):
     """
     Splits a dense text block into readable segments for bullet rendering.
@@ -155,6 +212,14 @@ def split_into_segments(text):
         if len(segments) > 1:
             return segments
 
+    # Pattern 1b: comma-separated "X (N pts)" items -- split on top-level commas
+    # only, ignoring commas nested inside parentheses (e.g. "(eliminatoire,
+    # note minimale 70%)"). Added Session 24 after visual review of rendered output.
+    if re.search(r'\(\s*[\d.]+\s*pts?\s*\)', text) and ',' in text:
+        segments = _split_top_level_commas(text)
+        if len(segments) > 1:
+            return segments
+
     # Pattern 2: arrow-prefixed lines already present (→) — split on them
     if '→' in text:
         parts = re.split(r'(?=→)', text)
@@ -168,6 +233,83 @@ def split_into_segments(text):
         return segments
 
     return [text]
+
+PLACEHOLDER_VALUES = {"non spécifié", "non specifie", "n/a", "non applicable", "", "-", "—"}
+def is_placeholder(value):
+    if value is None:
+        return True
+    return str(value).strip().lower() in PLACEHOLDER_VALUES
+
+def dedup_lists(*lists):
+    """
+    Merge multiple lists of strings into one, removing case-insensitive /
+    near-duplicate entries while preserving first-seen order and casing.
+    """
+    seen = set()
+    merged = []
+    for lst in lists:
+        for item in lst or []:
+            item = str(item).strip()
+            if not item:
+                continue
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged
+
+ROLE_SYNONYMS = {
+    "responsable de projet": "responsable_chef",
+    "chargé de projet": "responsable_chef",
+    "charge de projet": "responsable_chef",
+    "chef de projet": "responsable_chef",
+}
+
+def merge_roles(roles):
+    """
+    Merge 'Responsable de projet' / 'Chargé de projet' / 'Chef de projet'
+    into a single canonical role entry (same function at CHG per Alexandra).
+    Keeps the richer data from whichever source has: max years experience,
+    union of qualifications, non-placeholder title, non-empty points_differenciateurs.
+    Ported verbatim from tableau_decisionnel.py (Session 23) for consistency
+    across all client-facing documents (Session 24, item #7 rollout).
+    """
+    grouped = {}
+    order = []
+    for r in roles:
+        role_name = (r.get("role") or "").strip().lower()
+        key = ROLE_SYNONYMS.get(role_name)
+        if key is None:
+            order.append(dict(r))
+            continue
+        if key not in grouped:
+            entry = dict(r)
+            entry["role"] = "Responsable de projet"
+            grouped[key] = entry
+            order.append(entry)
+        else:
+            existing = grouped[key]
+            existing["annees_experience_min"] = max(
+                existing.get("annees_experience_min") or 0,
+                r.get("annees_experience_min") or 0,
+            )
+            existing["annees_experience_mentionnees"] = (
+                existing.get("annees_experience_mentionnees") or r.get("annees_experience_mentionnees")
+            )
+            existing["qualifications_obligatoires"] = dedup_lists(
+                existing.get("qualifications_obligatoires", []),
+                r.get("qualifications_obligatoires", []),
+            )
+            existing["qualifications_souhaitees"] = dedup_lists(
+                existing.get("qualifications_souhaitees", []),
+                r.get("qualifications_souhaitees", []),
+            )
+            if is_placeholder(existing.get("titre_requis")) and not is_placeholder(r.get("titre_requis")):
+                existing["titre_requis"] = r.get("titre_requis")
+            if not existing.get("points_differenciateurs") and r.get("points_differenciateurs"):
+                existing["points_differenciateurs"] = r.get("points_differenciateurs")
+    return order
 
 def cell_para_bulleted(cell, text, size=9, bg=None, force_split=True):
     """
@@ -193,6 +335,27 @@ def cell_para_bulleted(cell, text, size=9, bg=None, force_split=True):
             r.font.size = Pt(size)
 
 # ── Score qualificatif ─────────────────────────────────────────────────────────
+
+def cell_para_lines(cell, text, size=9, bg=None):
+    """
+    Renders text as plain line-broken paragraphs inside a cell (no bullets).
+    Uses split_into_segments() — the same helper already used by
+    cell_para_bulleted() — to handle comma-separated scoring conditions,
+    arrow-prefixed lines, and period/semicolon sentence splits. Replaces the
+    former narrow '; '-only split, which silently failed to break up
+    period-delimited scoring tiers (root-caused Session 22, fixed Session 24).
+    """
+    if bg:
+        set_cell_bg(cell, bg)
+    segments = split_into_segments(text) if text else []
+    if not segments:
+        segments = [text]
+    for i, seg in enumerate(segments):
+        p = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
+        no_space_para(p)
+        r = p.add_run(seg)
+        r.font.size = Pt(size)
+
 
 def get_qualificatif(score):
     if score >= 70:
@@ -498,8 +661,29 @@ def generate_gonogo_report(json_path, output_path):
     add_field_row(tbl1, "Budget estimé",          desc.get("budget_estime",""))
 
     # Conformité (merged into Table 1)
-    add_field_row(tbl1, "Visite obligatoire",
-                  ("Oui — " + fmt_date_fr(conf.get("date_visite",""))) if conf.get("visite_obligatoire") else "Non")
+    # Session 53: consolidated onto visite_lieux_obligatoire (3-state,
+    # citation-first) -- the legacy visite_obligatoire boolean/date_visite
+    # pair is removed from analyze_ao.py's schema going forward. Backward-
+    # compat fallback below handles older, already-persisted AO_DATA JSON
+    # that predates this consolidation and only has the legacy fields --
+    # same tolerance pattern oui_non_pas_specifie() already applies natively
+    # to True/False for consortium_autorise/sous_traitance_autorisee.
+    _visite_val = conf.get("visite_lieux_obligatoire")
+    if _visite_val is None:
+        _visite_val = conf.get("visite_obligatoire")
+    _visite_text = oui_non_pas_specifie(_visite_val)
+    _visite_date = conf.get("visite_lieux_date")
+    _visite_heure = conf.get("visite_lieux_heure")
+    _visite_lieu = conf.get("visite_lieux_lieu")
+    _visite_logistics = " ".join(x for x in [
+        fmt_date_fr(_visite_date) if _visite_date else "",
+        _visite_heure or "",
+    ] if x).strip()
+    if _visite_lieu:
+        _visite_logistics = f"{_visite_logistics}, {_visite_lieu}" if _visite_logistics else _visite_lieu
+    if _visite_logistics:
+        _visite_text += f" — {_visite_logistics}"
+    add_field_row(tbl1, "Visite obligatoire", _visite_text)
     add_field_row(tbl1, "Garantie de soumission",
                   f"Oui — {conf.get('montant_garantie','')}" if conf.get("garantie_soumission_requise") else "Non")
 
@@ -569,7 +753,7 @@ def generate_gonogo_report(json_path, output_path):
                   f"Oui{'  — ' + ress.get('montant_minimal_projets','') if ress.get('montant_minimal_projets') else ''}"
                   if ress.get("fiches_projets_requises") else "Non")
     add_field_row(tbl3a, "Sous-traitance autorisée",
-                  "Oui" if ress.get("sous_traitance_autorisee") else "Non")
+                  oui_non_pas_specifie(ress.get("sous_traitance_autorisee")))
 
     if ress.get("sous_traitance_recommandee"):
         domaines = ress.get("domaines_sous_traitance", [])
@@ -577,12 +761,33 @@ def generate_gonogo_report(json_path, output_path):
                       "Domaines: " + (", ".join(domaines) if domaines else "voir analyse"),
                       label_bg="FFF2CC")
 
+    # Cumul de rôles -- always shown (Session 54, same 3-state/citation
+    # pattern as visite_lieux_obligatoire: oui_non_pas_specifie() for the
+    # label, citation appended only when the value is oui/non -- never for
+    # non_specifie, matching the schema's own "non_specifie implies empty
+    # citation" invariant).
+    _cumul_val = ress.get("cumul_roles_autorise")
+    _cumul_text = oui_non_pas_specifie(_cumul_val)
+    _cumul_citation = ress.get("cumul_roles_autorise_citation")
+    if _cumul_val in ("oui", "non") and _cumul_citation:
+        _cumul_text += f" — « {truncate_citation(_cumul_citation)} »"
+    add_field_row(tbl3a, "Cumul de rôles autorisé", _cumul_text)
+
     # Consortium — always shown
     add_field_row(tbl3a, "Consortium autorisé",
-                  "Oui" if risques.get("consortium_autorise") else "Non")
+                  oui_non_pas_specifie(risques.get("consortium_autorise")))
+
+    # Autres disciplines procurées séparément -- always shown (Session 54,
+    # same pattern as above).
+    _disc_val = risques.get("autres_disciplines_separees")
+    _disc_text = oui_non_pas_specifie(_disc_val)
+    _disc_citation = risques.get("autres_disciplines_separees_citation")
+    if _disc_val in ("oui", "non") and _disc_citation:
+        _disc_text += f" — « {truncate_citation(_disc_citation)} »"
+    add_field_row(tbl3a, "Autres disciplines procurées séparément", _disc_text)
 
     # Rôles détaillés
-    roles = ress.get("roles_detailles", [])
+    roles = merge_roles(ress.get("roles_detailles", []))
     if roles:
         doc.add_paragraph()
         p_roles = doc.add_paragraph()
@@ -626,17 +831,8 @@ def generate_gonogo_report(json_path, output_path):
 
             pts_diff = role.get("points_differenciateurs","")
             bg_pts = ORANGE_BG if pts_diff and pts_diff.strip() else LIGHT_BLUE_BG
-            cell_para_bulleted(row.cells[4], pts_diff if pts_diff else "—", bg=bg_pts)
+            cell_para_lines(row.cells[4], pts_diff if pts_diff else "—", bg=bg_pts)
 
-        # Note under roles table
-        p_note = doc.add_paragraph()
-        p_note.paragraph_format.space_before = Pt(2)
-        r_note = p_note.add_run(
-            "* Colonne Points / Différenciateurs : liens automatiques avec les critères "
-            "d'évaluation — en cours d'optimisation."
-        )
-        r_note.italic = True; r_note.font.size = Pt(8)
-        r_note.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
 
     # ══════════════════════════════════════════════════════════════════════════
     # SECTION 4 — Détail des critères d'évaluation
@@ -695,6 +891,13 @@ def generate_gonogo_report(json_path, output_path):
         )
         r_pur.bold = True; r_pur.font.size = Pt(9)
         r_pur.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+    else:
+        p_elec = doc.add_paragraph()
+        r_elec = p_elec.add_run(
+            "Soumission électronique — délai Purolator non requis, 2 jours ouvrables gagnés"
+        )
+        r_elec.bold = True; r_elec.font.size = Pt(9)
+        r_elec.font.color.rgb = RGBColor(0x00, 0x80, 0x00)
 
     tbl5 = doc.add_table(rows=1, cols=3)
     tbl5.style = 'Table Grid'
@@ -782,15 +985,15 @@ def generate_gonogo_report(json_path, output_path):
         cell_para(row.cells[0], f"• {forts[i]}"   if i < len(forts)   else "")
         cell_para(row.cells[1], f"• {faibles[i]}" if i < len(faibles) else "")
 
-    # Concurrence placeholder (Phase 2)
+    # Analyse de la concurrence — only rendered when real data exists (Session 22 fix)
     concurrents = strat.get("concurrents_region", [])
-    doc.add_paragraph()
-    p_conc_title = doc.add_paragraph()
-    no_space_para(p_conc_title)
-    r_conc = p_conc_title.add_run("Analyse de la concurrence :")
-    r_conc.bold = True; r_conc.font.size = Pt(10); r_conc.font.color.rgb = CHG_BLUE
-
     if concurrents:
+        doc.add_paragraph()
+        p_conc_title = doc.add_paragraph()
+        no_space_para(p_conc_title)
+        r_conc = p_conc_title.add_run("Analyse de la concurrence :")
+        r_conc.bold = True; r_conc.font.size = Pt(10); r_conc.font.color.rgb = CHG_BLUE
+
         tbl_conc = doc.add_table(rows=1, cols=3)
         tbl_conc.style = "Table Grid"
         set_table_border(tbl_conc)
@@ -806,15 +1009,6 @@ def generate_gonogo_report(json_path, output_path):
             cell_para(row.cells[0], comp.get("nom",""))
             cell_para(row.cells[1], comp.get("region",""))
             cell_para(row.cells[2], comp.get("historique",""))
-    else:
-        p_conc2 = doc.add_paragraph()
-        p_conc2.paragraph_format.space_before = Pt(2)
-        r_conc2 = p_conc2.add_run(
-            "Données de concurrence à intégrer — Phase 2 "
-            "(source : LISTE GÉNÉRALE OS ET PROJETS.xlsx)"
-        )
-        r_conc2.italic = True; r_conc2.font.size = Pt(9)
-        r_conc2.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
 
     # ══════════════════════════════════════════════════════════════════════════
     # SECTION 7 — Incongruités et questions

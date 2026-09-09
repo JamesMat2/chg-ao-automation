@@ -7,6 +7,10 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from googleapiclient.http import MediaIoBaseDownload
 sys.path.insert(0, '/root')
+from analyze_ao import (
+    TruncatedResponseError, ResponseRefusedError,
+    apply_refusal_substitutions, restore_refusal_substitutions,
+)
 
 # ── Args from n8n ─────────────────────────────────────────────────────────────
 FILE_ID   = sys.argv[1] if len(sys.argv) > 1 else None
@@ -221,6 +225,7 @@ AO_FOLDER_ID = '1cXGe0n7GRSzRP1KlmcR6siDI8lppEH48'
 print(f"🔍 Searching for original AO in Drive (safe_name: {safe_name})...")
 ao_text = ""
 ao_data = {}
+ao_data_parse_failed = False
 ao_pdf_path = None
 
 try:
@@ -262,14 +267,38 @@ except Exception as e:
 # ── STEP 4: Analyze AO text to get ao_data ────────────────────────────────────
 if ao_text:
     today = datetime.date.today().strftime('%Y-%m-%d')
-    r = claude.messages.create(model="claude-sonnet-4-5-20250929", max_tokens=8000,
-        messages=[{"role": "user", "content": f"Aujourd'hui: {today}\nAO:\n{ao_text}\n\nUNIQUEMENT JSON sans backticks:\n{{\"client\":\"\",\"numero_ao\":\"\",\"titre_projet\":\"\",\"date_limite\":\"\",\"type_travaux\":\"\",\"competences_requises\":[],\"localisation\":\"\",\"resume_mandat\":\"\",\"points_addendas\":[]}}"}])
+
+    def _step4_call(text):
+        _r = claude.messages.create(model="claude-sonnet-4-5-20250929", max_tokens=8000,
+            messages=[{"role": "user", "content": f"Aujourd'hui: {today}\nAO:\n{text}\n\nUNIQUEMENT JSON sans backticks:\n{{\"client\":\"\",\"numero_ao\":\"\",\"titre_projet\":\"\",\"date_limite\":\"\",\"type_travaux\":\"\",\"competences_requises\":[],\"localisation\":\"\",\"resume_mandat\":\"\",\"points_addendas\":[]}}"}])
+        # Session 52: same undefended empty-content/refusal crash pattern as
+        # pipeline_w1.py's STEP 2 had before today (r.content[0] on an empty
+        # list) -- confirmed via the same real production incident (AO
+        # 13203), since this call re-extracts and re-sends the same
+        # principal-document text.
+        if not _r.content:
+            if _r.stop_reason == "refusal":
+                raise ResponseRefusedError(
+                    f"STEP 4: Claude refused to respond (stop_reason=refusal) — "
+                    f"content policy trigger, not a parse/truncation issue."
+                )
+            raise ResponseRefusedError(f"STEP 4: Claude response has no content (stop_reason={_r.stop_reason!r})")
+        return _r
+
+    try:
+        r = _step4_call(ao_text)
+    except ResponseRefusedError as _re:
+        print(f"  [refusal retry] STEP 4 initial call refused ({_re}) — retrying once with known-trigger-phrase substitution")
+        r = _step4_call(apply_refusal_substitutions(ao_text))
+
     resp = r.content[0].text.strip()
     if resp.startswith("```"): resp = resp.split("\n",1)[1].rsplit("```",1)[0].strip()
     try:
         ao_data = json.loads(resp)
-    except Exception:
+    except Exception as _json_e:
+        print(f"⚠️ STEP 4 JSON parse failed ({_json_e}) — falling back to filename-derived ao_data")
         ao_data = {"titre_projet": safe_name, "client": "", "type_travaux": ""}
+        ao_data_parse_failed = True
 else:
     ao_data = {"titre_projet": safe_name, "client": "", "type_travaux": ""}
 
@@ -530,6 +559,15 @@ RETOURNE UNIQUEMENT un JSON valide sans backticks:
 try:
     r = claude.messages.create(model="claude-sonnet-4-5-20250929", max_tokens=8000,
         messages=[{"role": "user", "content": content_prompt}])
+    # Session 52: diagnostic-only -- already gracefully degrades to fully
+    # empty content_data via the broad except below (sections_ok/
+    # degraded_reasons already flag this correctly, Item 3). No retry/
+    # substitution: expensive/slow call to retry blindly, no evidence this
+    # specific call has hit either failure mode in production.
+    if r.stop_reason == "max_tokens":
+        raise TruncatedResponseError(f"STEP 8 response truncated at max_tokens=8000")
+    if r.stop_reason == "refusal" or not r.content:
+        raise ResponseRefusedError(f"STEP 8 response refused or empty (stop_reason={r.stop_reason!r})")
     resp = r.content[0].text.strip()
     if resp.startswith("```"): resp = resp.split("\n",1)[1].rsplit("```",1)[0].strip()
     raw_data = json.loads(resp)
@@ -553,6 +591,18 @@ try:
 except Exception as e:
     print(f"⚠️ Section generation failed: {e}")
     content_data = {"lettre_presentation": "", "sections": [], "conclusion": ""}
+
+# Session 51: signal for N8N_OUTPUT -- doc.save() below runs unconditionally
+# regardless of content quality, so unlike pipeline_w1.py's *_report_path
+# there's no existing None-style proxy for "did generation actually work".
+sections_ok = bool(content_data.get("sections"))
+
+# Session 52: single, unconditional restoration point -- covers both STEP 4's
+# ao_data and STEP 8's content_data (built from ao_data) in one pass, right
+# before either is used to write actual text into the document below. Safe/
+# idempotent whether or not the refusal-retry path was ever taken this run.
+ao_data = restore_refusal_substitutions(ao_data)
+content_data = restore_refusal_substitutions(content_data)
 
 # ── STEP 9: Build Word document ───────────────────────────────────────────────
 print("📝 Building Word document...")
@@ -727,13 +777,33 @@ if content_data.get('conclusion'):
             doc.add_paragraph(para.strip())
 
 # Save
-output_path = f"/local-files/Proposition_CHG_{safe_name}.docx"
+# Session 32 fix: key output_path by FILE_ID (not sanitized filename) to
+# eliminate the collision risk fixed for the Go/No-Go report in Session 31 -
+# two approvals producing the same sanitized safe_name would otherwise
+# silently overwrite each other's OS document.
+output_path = f"/local-files/Proposition_CHG_{FILE_ID}.docx"
 doc.save(output_path)
 print(f"✅ OS proposal saved: {output_path}")
 
 # ── N8N_OUTPUT ────────────────────────────────────────────────────────────────
+# Session 51: status/degraded_reasons from sections_ok (STEP 8, line ~555) and
+# the AO re-extraction outcome (ao_text, STEP 3) -- both already-existing
+# signals, just not previously surfaced. "success" stays the literal string
+# for full success, unchanged from today; "partial" is newly introduced on
+# paths previously always mislabeled "success". No "error" case here: if
+# doc.save() itself throws, the script exits non-zero and pipeline_server.py
+# already reports "error" correctly via the subprocess return code.
+degraded_reasons = []
+if not sections_ok:
+    degraded_reasons.append("sections_empty")
+if not ao_text:
+    degraded_reasons.append("ao_text_unavailable")
+if ao_data_parse_failed:
+    degraded_reasons.append("ao_data_parse_failed")
+
 result = {
-    "status": "success",
+    "status": "success" if (sections_ok and ao_text and not ao_data_parse_failed) else "partial",
+    "degraded_reasons": degraded_reasons,
     "ao_client": ao_data.get("client", ""),
     "ao_titre":  ao_data.get("titre_projet", safe_name),
     "output_file": output_path.replace("/local-files/", "/files/"),
